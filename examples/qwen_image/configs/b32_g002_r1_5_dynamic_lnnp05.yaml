@@ -1,0 +1,27 @@
+exp_tag: qwen_one_step_gan
+
+pretrained_ckpt_path_gen: ~
+pretrained_ckpt_path_dis: ~
+
+learning_rate: !!float 5e-5
+learning_rate_dis: !!float 5e-6
+accumulate_grad_batches: 4
+max_epochs: 20
+use_gradient_checkpointing: True
+viz_iters: 3
+save_ckpt_iters: 1000
+relaxed_mean_size: 100
+use_dual_condition_flag: False
+
+
+rgb_w: 1.0
+lpips_w: 1.0
+gan_type: vanilla
+gan_loss_weight: 0.02
+real_label_val: 1.0
+fake_label_val: 0.0
+d_iters: 1 # rec: 1~5
+r1_regularization: 5.0
+r2_regularization: 0.0
+variance: 0.005
+lq_no_noise_prob: 0.5

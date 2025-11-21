@@ -4,7 +4,11 @@ from typing import Tuple, Optional, Union, List
 from einops import rearrange
 from .sd3_dit import TimestepEmbeddings, RMSNorm
 from .flux_dit import AdaLayerNorm
+import os
+import matplotlib.pyplot as plt
+import numpy as np
 
+debug = False
 
 class ApproximateGELU(nn.Module):
     def __init__(self, dim_in: int, dim_out: int, bias: bool = True):
@@ -127,6 +131,58 @@ class QwenFeedForward(nn.Module):
             hidden_states = module(hidden_states)
         return hidden_states
 
+def compute_and_save_attention(joint_q, joint_k, save_dir="attn_debug"):
+    """
+    自动保存每次调用的 attention q@k^T，并生成可视化热力图（拼成 4x6 的head网格图）。
+    设定：text=0:18, noise=18:18+1024。
+    """
+    if not hasattr(compute_and_save_attention, "layer_counter"):
+        compute_and_save_attention.layer_counter = 0
+    layer_idx = compute_and_save_attention.layer_counter
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 1. scaled dot-product attention
+    scale = joint_q.size(-1) ** -0.5
+    attn_scores = torch.matmul(joint_q, joint_k.transpose(-2, -1)) * scale
+    attn_scores = attn_scores.softmax(dim=-1)
+    
+    # 2. 取 noise->text 注意力
+    text_start, text_end = 0, 18
+    noise_start, noise_end = 18, 18 + 1024
+    attn_noise_to_text = attn_scores[:, :, noise_start:noise_end, text_start:text_end]  # [B,H,1024,18]
+
+    # 3. 对 text keys 求平均
+    avg_key = attn_noise_to_text.mean(dim=-1)  # [B,H,1024]
+
+    # 4. 为所有 head 生成热力图
+    fig, axes = plt.subplots(4, 6, figsize=(12, 8))
+    axes = axes.flatten()
+
+    for head_index in range(24):
+        avg_head = avg_key[:, head_index, :]  # [B,1024]
+        heatmap = avg_head[0].reshape(32, 32).detach().cpu().float().numpy()
+
+        ax = axes[head_index]
+        im = ax.imshow(heatmap, cmap='viridis')
+        ax.set_title(f"H{head_index}", fontsize=8)
+        ax.axis('off')
+
+    # 去掉多余子图（如果head<24）
+    for i in range(24, len(axes)):
+        axes[i].axis('off')
+
+    plt.tight_layout()
+    png_save_path = os.path.join(save_dir, f"attn_heatmap_layer{layer_idx:02d}_allheads.png")
+    plt.savefig(png_save_path, bbox_inches='tight', pad_inches=0.1, dpi=150)
+    plt.close()
+
+    print(f"✅ Saved combined attention map (layer {layer_idx}) at: {png_save_path}")
+
+    # 5. 更新计数器
+    compute_and_save_attention.layer_counter += 1
+    
+
 class QwenDoubleStreamAttention(nn.Module):
     def __init__(
         self,
@@ -186,7 +242,24 @@ class QwenDoubleStreamAttention(nn.Module):
         joint_k = torch.cat([txt_k, img_k], dim=2)
         joint_v = torch.cat([txt_v, img_v], dim=2)
 
-        joint_attn_out = torch.nn.functional.scaled_dot_product_attention(joint_q, joint_k, joint_v)
+        if debug:
+            L_txt = txt_q.size(2)
+            L_img = img_q.size(2)
+            L_joint = L_txt + L_img
+            print(f"lengths: txt-{L_txt}, L_img-{L_img}")
+
+            gamma = float(os.environ.get("attention_gamma", 1.0))
+            eps = 1e-5
+
+            # compute_and_save_attention(joint_q, joint_k)
+            attn_bias = torch.zeros(L_joint, L_joint, device=joint_q.device, dtype=joint_q.dtype)
+            tmp =  torch.log(torch.tensor(gamma, dtype=joint_q.dtype, device=joint_q.device) + eps)
+            print(tmp)
+            attn_bias[L_txt:, :L_txt] = tmp
+            attn_bias[:L_txt, L_txt:] = tmp
+            joint_attn_out = torch.nn.functional.scaled_dot_product_attention(joint_q, joint_k, joint_v, attn_mask=attn_bias)
+        else:
+            joint_attn_out = torch.nn.functional.scaled_dot_product_attention(joint_q, joint_k, joint_v)
 
         joint_attn_out = rearrange(joint_attn_out, 'b h s d -> b s (h d)').to(joint_q.dtype)
 
@@ -236,8 +309,13 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_mlp = QwenFeedForward(dim=dim, dim_out=dim)
     
     def _modulate(self, x, mod_params):
-        shift, scale, gate = mod_params.chunk(3, dim=-1)
-        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1), gate.unsqueeze(1)    
+        if mod_params.ndim == 2:
+            shift, scale, gate = mod_params.chunk(3, dim=-1)
+            return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1), gate.unsqueeze(1) 
+        else:
+            # [B, 2L, 3*dim]
+            shift, scale, gate = mod_params.chunk(3, dim=-1)
+            return x * (1 + scale) + shift, gate   
 
     def forward(
         self,
@@ -246,8 +324,16 @@ class QwenImageTransformerBlock(nn.Module):
         temb: torch.Tensor, 
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
+        b,L,c = image.shape
+        L = L//2
         img_mod_attn, img_mod_mlp = self.img_mod(temb).chunk(2, dim=-1)  # [B, 3*dim] each
+        # after replace img_mod's linear, [B, 2, 3*dim] each
+        if img_mod_attn.ndim == 3:
+            assert img_mod_attn.shape[1] == 2 # 这里是2 是因为img_mod用两套参数区别对待了temb输入
+            # broadcast to [B, 2L, 3*dim]
+            img_mod_attn = torch.repeat_interleave(img_mod_attn, repeats=L, dim=1)
+            img_mod_mlp  = torch.repeat_interleave(img_mod_mlp, repeats=L, dim=1)
+            
         txt_mod_attn, txt_mod_mlp = self.txt_mod(temb).chunk(2, dim=-1)  # [B, 3*dim] each
 
         img_normed = self.img_norm1(image)

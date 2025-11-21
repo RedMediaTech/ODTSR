@@ -1,7 +1,7 @@
 import torch
 from typing import List, Optional, Tuple, Union
 from torch import nn
-
+from .tiler import TileWorker
 
 CACHE_T = 2
 
@@ -703,7 +703,33 @@ class QwenImageVAE(torch.nn.Module):
         self.mean = torch.tensor(mean).view(1, 16, 1, 1, 1)
         self.std = 1 / torch.tensor(std).view(1, 16, 1, 1, 1)
 
+    def tiled_encode(self, sample, tile_size = 64, tile_stride = 32):
+        latent_states = TileWorker().tiled_forward(
+            lambda x: self.encode(x),
+            sample,
+            tile_size,
+            tile_stride,
+            tile_device=sample.device,
+            tile_dtype=sample.dtype
+        )
+        return latent_states
+
+    def tiled_decode(self, sample, tile_size = 64, tile_stride = 32):
+        latent_states = TileWorker().tiled_forward(
+            lambda x: self.decode(x),
+            sample,
+            tile_size,
+            tile_stride,
+            tile_device=sample.device,
+            tile_dtype=sample.dtype
+        )
+        return latent_states
+
     def encode(self, x, **kwargs):
+        if kwargs.get("tiled", False):
+            from rich import print
+            print("[green]debug: using tiled encode[/green]")
+            return self.tiled_encode(x, tile_size=kwargs.get("tile_size", 64), tile_stride=kwargs.get("tile_stride", 32))
         x = x.unsqueeze(2)
         x = self.encoder(x)
         x = self.quant_conv(x)
@@ -714,6 +740,10 @@ class QwenImageVAE(torch.nn.Module):
         return x
     
     def decode(self, x, **kwargs):
+        if kwargs.get("tiled", False):
+            from rich import print
+            print("[green]debug: using tiled decode[/green]")
+            return self.tiled_decode(x, tile_size=kwargs.get("tile_size", 64), tile_stride=kwargs.get("tile_stride", 32))
         x = x.unsqueeze(2)
         mean, std = self.mean.to(dtype=x.dtype, device=x.device), self.std.to(dtype=x.dtype, device=x.device)
         x = x / std + mean

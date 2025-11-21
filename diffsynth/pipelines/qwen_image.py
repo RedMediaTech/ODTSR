@@ -16,6 +16,12 @@ from ..lora import GeneralLoRALoader
 from ..vram_management import gradient_checkpoint_forward, enable_vram_management, AutoWrappedModule, AutoWrappedLinear
 
 
+def disturb_lq(lq_latents, noise, sigma  = 1.0):
+    """
+        sigma越大越接近噪声起点
+    """
+    return (1-sigma) * lq_latents + sigma * noise
+
 
 class QwenImagePipeline(BasePipeline):
 
@@ -52,9 +58,13 @@ class QwenImagePipeline(BasePipeline):
         timestep_id = torch.randint(0, self.scheduler.num_train_timesteps, (1,))
         timestep = self.scheduler.timesteps[timestep_id].to(dtype=self.torch_dtype, device=self.device)
         
-        inputs["latents"] = self.scheduler.add_noise(inputs["input_latents"], inputs["noise"], timestep)
-        training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep)
-        
+        start_point = disturb_lq(inputs['condition_latents'], inputs["noise"])
+
+        # add noise会根据t做前面两个参数的线性插值
+        inputs["latents"] = self.scheduler.add_noise(inputs["input_latents"], start_point, timestep)
+        # training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep)
+        training_target = start_point - inputs["input_latents"]
+
         noise_pred = self.model_fn(**inputs, timestep=timestep)
         
         loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
@@ -171,7 +181,78 @@ class QwenImagePipeline(BasePipeline):
             pipe.tokenizer = Qwen2Tokenizer.from_pretrained(tokenizer_config.path)
         return pipe
     
-    
+    @torch.no_grad()
+    def TI2I(self,
+             prompt,
+             negative_prompt,
+             cfg_scale,
+             condition_image, # PIL image
+             num_inference_steps = 14,
+             seed = 42,
+             progress_bar_cmd = tqdm,
+             tiled = False,
+             tile_size = None,
+             tile_stride = None
+             ):
+        """
+            需要输入lq和文本
+
+            起点:disturb_lq
+        """
+        import copy
+        original_scheduler = copy.deepcopy(self.scheduler)
+        self.scheduler.set_timesteps(num_inference_steps, shift=1)
+
+        # Parameters
+        inputs_posi = {
+            "prompt": prompt,
+        }
+        inputs_nega = {
+            "negative_prompt": negative_prompt,
+        }
+        inputs_shared = {
+            "cfg_scale": cfg_scale,
+            "input_image": None,
+            "condition_image": condition_image,
+            "height": condition_image.size[1], "width": condition_image.size[0],
+            "seed": seed, "rand_device": self.device,
+            "tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride,
+        }
+        
+        for unit in self.units:
+            inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
+        
+        # 更改latents为新的起点，即noised lq
+        inputs_shared['latents'] = disturb_lq(inputs_shared['condition_latents'], inputs_shared['noise'])
+
+        self.load_models_to_device(self.in_iteration_models)
+
+        models = {name: getattr(self, name) for name in self.in_iteration_models}
+        for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
+            timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
+
+            # Inference
+            noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep, progress_id=progress_id)
+            if cfg_scale != 1.0:
+                noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep, progress_id=progress_id)
+                noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+            else:
+                noise_pred = noise_pred_posi
+
+            # Scheduler
+            inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
+        
+        # Decode
+        self.load_models_to_device(['vae'])
+        image = self.vae.decode(inputs_shared["latents"], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        image = self.vae_output_to_image(image)
+        self.load_models_to_device([])
+
+        # back
+        self.scheduler = original_scheduler
+
+        return image
+
     @torch.no_grad()
     def __call__(
         self,
@@ -267,18 +348,31 @@ class QwenImageUnit_NoiseInitializer(PipelineUnit):
 class QwenImageUnit_InputImageEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("input_image", "noise", "tiled", "tile_size", "tile_stride"),
+            input_params=("input_image", "condition_image", "noise", "tiled", "tile_size", "tile_stride"),
             onload_model_names=("vae",)
         )
 
-    def process(self, pipe: QwenImagePipeline, input_image, noise, tiled, tile_size, tile_stride):
-        if input_image is None:
-            return {"latents": noise, "input_latents": None}
+    def process(self, pipe: QwenImagePipeline, input_image, condition_image, noise, tiled, tile_size, tile_stride):
         pipe.load_models_to_device(['vae'])
+        # 将PIL image (uint8) 转为-1~1   [1,c,h,w]
+
+        if condition_image is not None:
+            condition_image = pipe.preprocess_image(condition_image).to(device=pipe.device, dtype=pipe.torch_dtype)
+            if tile_size is None:
+                condition_latents = pipe.vae.encode(condition_image, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            else:
+                condition_latents = pipe.vae.encode(condition_image, tiled=tiled, tile_size=tile_size * 8, tile_stride=tile_stride * 8)
+        else:
+            condition_latents = None
+        #  推理
+        if input_image is None:
+            return {"latents": noise, "input_latents": None, "condition_latents": condition_latents, "condition_rgb": condition_image}
+        
+        # 将PIL image (uint8) 转为-1~1   [1,c,h,w]
         image = pipe.preprocess_image(input_image).to(device=pipe.device, dtype=pipe.torch_dtype)
         input_latents = pipe.vae.encode(image, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         if pipe.scheduler.training:
-            return {"latents": noise, "input_latents": input_latents}
+            return {"latents": noise, "input_latents": input_latents, "condition_latents": condition_latents, "input_rgb": image, "condition_rgb": condition_image}
         else:
             latents = pipe.scheduler.add_noise(input_latents, noise, timestep=pipe.scheduler.timesteps[0])
             return {"latents": latents, "input_latents": None}
@@ -302,7 +396,7 @@ class QwenImageUnit_PromptEmbedder(PipelineUnit):
         return split_result
 
     def process(self, pipe: QwenImagePipeline, prompt) -> dict:
-        if pipe.text_encoder is not None:
+        if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None and prompt is not None:
             prompt = [prompt]
             template = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
             drop_idx = 34
@@ -322,10 +416,50 @@ class QwenImageUnit_PromptEmbedder(PipelineUnit):
             return {}
 
 
+def tiled_model_fn_qwen_image(
+    dit,
+    latents,
+    condition_latents,
+    timestep,
+    prompt_emb,
+    prompt_emb_mask,
+    tile_size,
+    tile_stride
+):
+    from diffsynth.models.tiler import TileWorker
+
+    def chunk_function(x):
+        assert x.size(1) % 2 == 0
+        split_size = x.size(1) // 2
+        hidden_part, lr_part = torch.split(
+            x, 
+            split_size_or_sections=split_size, 
+            dim=1
+        )
+        return model_fn_qwen_image(
+            dit,
+            hidden_part,
+            lr_part,
+            timestep,
+            prompt_emb,
+            prompt_emb_mask,
+            hidden_part.shape[2] * 8,
+            hidden_part.shape[3] * 8
+        )
+    latents = TileWorker().tiled_forward(
+        chunk_function,
+        torch.concat([latents, condition_latents], dim=1),  # 由于有两个输入 都需要tile 所以在c维度 先concat
+        tile_size,
+        tile_stride,
+        tile_device=latents.device,
+        tile_dtype=latents.dtype
+    )
+    return latents
 
 def model_fn_qwen_image(
     dit: QwenImageDiT = None,
     latents=None,
+    condition_latents = None,
     timestep=None,
     prompt_emb=None,
     prompt_emb_mask=None,
@@ -335,16 +469,30 @@ def model_fn_qwen_image(
     use_gradient_checkpointing_offload=False,
     **kwargs
 ):
+    if kwargs.get('tiled', False):
+        from rich import print
+        print("[green]debug: using tiled dit[/green]")
+        return tiled_model_fn_qwen_image(dit, latents, condition_latents, timestep, prompt_emb, prompt_emb_mask, kwargs.get('tile_size'), kwargs.get('tile_stride'))
+    
     img_shapes = [(latents.shape[0], latents.shape[2]//2, latents.shape[3]//2)]
     txt_seq_lens = prompt_emb_mask.sum(dim=1).tolist()
     timestep = timestep / 1000
     
     image = rearrange(latents, "B C (H P) (W Q) -> B (H W) (C P Q)", H=height//16, W=width//16, P=2, Q=2)
-    
+
+    if condition_latents is not None:
+        image_control = rearrange(condition_latents, "B C (H P) (W Q) -> B (H W) (C P Q)", H=height//16, W=width//16, P=2, Q=2)
+        _, lll, _ = image.shape
+        image = torch.cat([image, image_control], dim=1)
+
     image = dit.img_in(image)
     text = dit.txt_in(dit.txt_norm(prompt_emb))
     conditioning = dit.time_text_embed(timestep, image.dtype)
-    image_rotary_emb = dit.pos_embed(img_shapes, txt_seq_lens, device=latents.device)
+    image_rotary_emb = dit.pos_embed(img_shapes, txt_seq_lens, device=latents.device) # [4096, 64]  [n, 64]
+    if condition_latents is not None:
+        image_rotary_emb_control = (torch.cat([image_rotary_emb[0], image_rotary_emb[0]], dim=0), image_rotary_emb[1])
+    else:
+        image_rotary_emb_control = image_rotary_emb
 
     for block in dit.transformer_blocks:
         text, image = gradient_checkpoint_forward(
@@ -354,9 +502,12 @@ def model_fn_qwen_image(
             image=image,
             text=text,
             temb=conditioning,
-            image_rotary_emb=image_rotary_emb,
+            image_rotary_emb=image_rotary_emb_control,
         )
-    
+        
+    if condition_latents is not None:
+        image = image[:, 0:lll, :]
+
     image = dit.norm_out(image, conditioning)
     image = dit.proj_out(image)
     

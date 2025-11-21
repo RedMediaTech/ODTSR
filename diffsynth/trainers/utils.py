@@ -4,7 +4,7 @@ from PIL import Image
 import pandas as pd
 from tqdm import tqdm
 from accelerate import Accelerator
-
+from accelerate.utils import DistributedDataParallelKwargs
 
 
 class ImageDataset(torch.utils.data.Dataset):
@@ -391,12 +391,49 @@ def launch_training_task(
     num_epochs: int = 1,
     gradient_accumulation_steps: int = 1,
 ):
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0])
-    accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation_steps)
+    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, num_workers=3, collate_fn=lambda x: x[0])
+    accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation_steps,
+                              kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],)
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     
+    from datetime import datetime
+    from contextlib import redirect_stdout
+    baseworkdir = os.path.join("./experiments", model_logger.output_path)
+    if accelerator.is_main_process:
+        current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+        model_logger.output_path =os.path.join("./experiments", model_logger.output_path, current_time)
+        workdir = model_logger.output_path
+        os.makedirs(workdir, exist_ok=False)
+        # trt_logger = TensorBoardLogger(workdir, name="tensorboard")
+
+        # backup config file
+        # yaml_file_name = os.path.basename(args.mmaigc_dataset_yml)
+        # target_path = os.path.join(workdir, yaml_file_name)
+        # shutil.copy2(args.mmaigc_dataset_yml, target_path)
+        
+        # plot model structure
+        filename = os.path.join(workdir, 'model_structure.txt')
+        with open(filename, "a") as f:
+            with redirect_stdout(f):
+                print(model.module.pipe)
+                
+        # 获取生成器可训练参数名字并写入文件
+        filename = os.path.join(workdir, 'trainable_parameters.txt')
+        with open(filename, "a") as f:
+            with redirect_stdout(f):
+                for name, param in model.module.pipe.named_parameters():
+                    if param.requires_grad:
+                        print(name)
+
+    accelerator.wait_for_everyone()
+    
+    subdirs = [d for d in os.listdir(baseworkdir) if os.path.isdir(os.path.join(baseworkdir, d))]
+    latest = max(subdirs)
+    baseworkdir = os.path.join(baseworkdir, latest)
+
     for epoch_id in range(num_epochs):
-        for data in tqdm(dataloader):
+        for idx, data in enumerate(dataloader):
+            accelerator.print("now idx:", idx)
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 loss = model(data)
@@ -404,6 +441,39 @@ def launch_training_task(
                 optimizer.step()
                 model_logger.on_step_end(loss)
                 scheduler.step()
+
+            # 如果iter满足要求，每个进程进行多步推理，参考pipe的call重新写推理
+            if idx % 50 == 0:
+                gt_img = data['gt']
+                lq_img = data['lq']
+                prompt = "4k, highly detailed, perfect without deformations, Photographic realism"
+                if accelerator.local_process_index == 7:
+                    prompt = "beautiful women, " + prompt
+                
+                accelerator.print(data['text'])
+
+                cfg_scale = accelerator.local_process_index + 1
+
+                res_img = model.module.pipe.TI2I(
+                    prompt = prompt,
+                    negative_prompt = "jpeg artifacts, oversharpening",
+                    cfg_scale = cfg_scale,
+                    condition_image = lq_img,
+                    num_inference_steps = 40
+                )
+                
+                imgs = [gt_img, lq_img, res_img]
+                h = max(im.height for im in imgs)
+                total_w = sum(im.width for im in imgs)
+                canvas = Image.new('RGB', (total_w, h))
+
+                x = 0
+                for im in imgs:
+                    canvas.paste(im, (x, 0))
+                    x += im.width
+                
+                canvas.save(os.path.join(baseworkdir, f"iter_{idx}_rank_{accelerator.local_process_index}_cfg_{cfg_scale}.png"))
+
         model_logger.on_epoch_end(accelerator, model, epoch_id)
 
 
@@ -503,4 +573,17 @@ def qwen_image_parser():
     parser.add_argument("--use_gradient_checkpointing", default=False, action="store_true", help="Whether to use gradient checkpointing.")
     parser.add_argument("--use_gradient_checkpointing_offload", default=False, action="store_true", help="Whether to offload gradient checkpointing to CPU memory.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps.")
+    # for sr task training
+    parser.add_argument("--deg_file_path", type=str, default=None, required=True, help="The path of the deg yaml.")
+    parser.add_argument("--dataset_txt_paths", type=str, default=None, required=True, help="The path of the images.")
+    parser.add_argument('--highquality_dataset_txt_paths', type=str, nargs='?', default=None, help='Paths to high quality dataset txt files')
+    parser.add_argument("--null_text_ratio", type=float, default=0, help="null_text_ratio")
+    parser.add_argument("--use_qwen", default=False, action="store_true", help="Whether to use qwen to get prompt",)
+    # for sr task inference
+    parser.add_argument("--input_path", type=str, default=None, required=False, help="The path of the input dir.")
+    parser.add_argument("--trained_ckpt", type=str, default=None, required=False, help="Path to trained_ckpt.")
+    parser.add_argument("--output_dir", type=str, default="./test_outputs", help="Path to save the results.")
+    parser.add_argument("--scale", type=float, default=2.0, help="sr scale")
+    parser.add_argument("--cfg", type=float, default=2.5, help="cfg")
+    parser.add_argument("--start_end", type=str, default="0,", help="index range")
     return parser

@@ -6,3 +6,5 @@ experiments/
 test_outputs/
 ckpt/
 onnx/
+models/Qwen/Qwen-Image
+models/HunyuanVideo
