@@ -1,0 +1,8 @@
+*.pyc
+*.log
+diffsynth.egg-info/
+checkpoint/
+experiments/
+test_outputs/
+ckpt/
+onnx/
