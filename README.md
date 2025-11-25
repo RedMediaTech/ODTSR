@@ -3,7 +3,7 @@
 Controllable Real-World Image Super-Resolution</h2>
 
 
-<a href=''><img src='https://img.shields.io/badge/Paper-Arxiv-red'></a>
+<a href='https://arxiv.org/abs/2511.17138'><img src='https://img.shields.io/badge/Paper-Arxiv-red'></a>
 
 
 Xiaohongshu Inc, Shanghai Jiao Tong University
@@ -11,10 +11,11 @@ Xiaohongshu Inc, Shanghai Jiao Tong University
 
 
 ## ⏰ Update
+- **2025.11.25**: Arxiv link(including supplementary materials) is released.
 - **2025.11.21**: code is released.
 
 
-:star: If ODTSR is helpful to you, please help star this repo. Thanks! :hugs:
+:star: If ODTSR is helpful to you, please help star this repo. Thanks! 
 
 ## 🌟 Overview Framework
 ![ODTSR_1](static/1.png)
@@ -44,16 +45,52 @@ dataset. As f decreases from 1 to 0, detail generation and prompt adherence grad
 
 ## ⚙ Dependencies and Installation
 
-to be updated
+1. prepare conda env:
+```
+conda create -n yourenv python=3.11
+```
+2. install pytorch (we recommend pytorch 2.6):
+```
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0  -f https://mirrors.aliyun.com/pytorch-wheels/cu124/
+```
+3. install this repo (based on [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio/tree/main)):
+```
+cd xxxx/ODTSR
+pip3 install -e . -v  -i https://mirrors.cloud.tencent.com/pypi/simple
+```
+note: It will automatically install the required packages based on the requirements file.
+
+4. install basicsr(for training, dataloader):
+```
+pip install basicsr
+```
+note:
+Because basicsr has not been updated for several years, there is an API bug that needs to be fixed.
+You can apply the fix with the following command:
+```
+sed -i '8s/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms._functional_tensor import rgb_to_grayscale/' /opt/conda/lib/python3.11/site-packages/basicsr/data/degradations.py
+```
+Make sure to replace **/opt/conda** with the path to your own Conda environment.
+
+5. download base model to your disk: [qwen-iamge](https://huggingface.co/Qwen/Qwen-Image/tree/main)
+
+6. download base model to your disk: [wan2.1](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/tree/main) (only training need)
+
 
 ## 🍭 Inference with script
+note: you need at least 40GB GPU memory to infer.Using CPU offload can reduce GPU memory usage, but it is not supported yet.
 
-to be updated
+```
+sh examples/qwen_image/test_gan.sh
+```
+<img src="static/infer.png" alt="" >
 
 ## 🎦 Inference with gradio
 
-to be updated
-
+```
+sh examples/qwen_image/test_gradio.sh
+```
+<img src="static/gradio.jpeg" alt="" >
 ## 🔥 Training
 
 to be updated
