@@ -78,8 +78,9 @@ Make sure to replace **/opt/conda** with the path to your own Conda environment.
 
 
 ## 🍭 Inference with script
-note: you need at least 40GB GPU memory to infer.Using CPU offload can reduce GPU memory usage, but it is not supported yet.
+> note: you need at least 40GB GPU memory to infer.Using CPU offload can reduce GPU memory usage, but it is not supported yet.
 
+> Our code now supports tile-based processing (tile size: 512×512), enabling input of arbitrary resolutions and super-resolution at any scale factor.
 ```
 sh examples/qwen_image/test_gan.sh
 ```
@@ -91,6 +92,7 @@ sh examples/qwen_image/test_gan.sh
 sh examples/qwen_image/test_gradio.sh
 ```
 <img src="static/gradio.jpeg" alt="" >
+
 ## 🔥 Training
 
 to be updated
