@@ -83,13 +83,16 @@ sed -i '8s/from torchvision.transforms.functional_tensor import rgb_to_grayscale
 
 5. Download base model to your disk: [Qwen-Image](https://huggingface.co/Qwen/Qwen-Image/tree/main)
 
-6. (For training) Download base model to your disk: [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/tree/main) 
+6. (For training) Download base model to your disk: [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/tree/main)
+7. (For inference) Download the trained ODTSR model weight: [huggingface](https://huggingface.co/double8fun/ODTSR/tree/main)
 
 
 ## 🍭 Inference with script
-> Note: you need at least 40GB GPU memory to infer. We will support CPU offload to reduce GPU memory usage soon.
+Note: you need at least 40GB GPU memory to infer. We will support CPU offload to reduce GPU memory usage soon.
 
-> We now supports tile-based processing (tile size: 512×512), enabling input of arbitrary resolutions and SR at any scale factor.
+We now supports tile-based processing (tile size: 512×512), enabling input of arbitrary resolutions and SR at any scale factor.  
+
+Please replace ``experiments/qwen_one_step_gan/${EXP_DATE}/checkpoints/net_gen_iter_10001.pth`` with the trained ODTSR model weight.
 ```
 sh examples/qwen_image/test_gan.sh
 ```
