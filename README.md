@@ -1,5 +1,5 @@
 <div align="center">
-<h2>One-Step Diffusion Transformer for
+<h2>[CVPR2026] One-Step Diffusion Transformer for
 Controllable Real-World Image Super-Resolution</h2>
 
 
@@ -14,6 +14,7 @@ Ya Zhang<sup>1</sup>&nbsp;&nbsp;&nbsp;&nbsp;Xiaoyun Zhang<sup>1,†</sup>&nbsp;&
 
 
 ## ⏰ Update
+- **2026.02.21**: The paper is accepted by CVPR2026!
 - **2025.11.25**: The paper (including supplementary materials) is released on [arXiv](https://arxiv.org/abs/2511.17138).
 - **2025.11.21**: Code is released.
 
